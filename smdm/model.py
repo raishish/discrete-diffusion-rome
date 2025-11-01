@@ -1,0 +1,469 @@
+# A clean and modular reimplementation of the AutoRegressive and Diffusion models
+# for the paper "Scaling up Masked Diffusion Models on Text"
+# Paper: https://arxiv.org/abs/2410.18514
+# Official Github repo: https://github.com/ML-GSAI/SMDM
+# The SMDM repo is inspired by Lightning-AI/litgpt
+# Ref: https://github.com/ML-GSAI/SMDM/blob/main/lit_gpt/model.py / diffmodel.py
+
+import math
+from typing import Optional, Tuple, Any, Self, List
+import torch
+import torch.nn as nn
+from litgpt.config import Config
+from .config import get_config_class
+
+
+RoPECache = Tuple[torch.Tensor, torch.Tensor]
+KVCache = Tuple[torch.Tensor, torch.Tensor]
+
+
+def build_rope_cache(
+    seq_len: int, n_elem: int, dtype: torch.dtype, device: torch.device, base: int = 10000, condense_ratio: int = 1
+) -> RoPECache:
+    """
+    Builds the RoPE cache.
+    Ref: https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/labml_nn/transformers/rope/__init__.py
+    MIT License: https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/license
+
+    Args:
+        seq_len: Length of the sequence.
+        n_elem: Number of elements.
+        dtype: Data type of the tensors.
+        device: Device to create the tensors on.
+        base: Base for the positional encoding.
+        condense_ratio: Ratio to condense the sequence length.
+    Returns:
+        tuple of cos and sin PEs, shape: (seq_len, n_elem // 2)
+    """
+    # $\Theta = {\theta_i = 10000^{\frac{2(i-1)}{d}}, i \in [1, 2, ..., \frac{d}{2}]}$
+    theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, device=device) / n_elem))    # (n_elem // 2)
+
+    # Create position indexes `[0, 1, ..., seq_len - 1]`
+    seq_idx = torch.arange(seq_len, device=device) / condense_ratio     # (seq_len,)
+
+    # Calculate the product of position index and $\theta_i$
+    idx_theta = torch.outer(seq_idx, theta)     # (seq_len, n_elem // 2)
+
+    cos, sin = torch.cos(idx_theta), torch.sin(idx_theta)
+
+    # added by peiyuan to ensure same data type with q, k, to use fused rotary embedding
+    if dtype == torch.bfloat16:
+        return cos.to(dtype), sin.to(dtype)
+    # this is to mimic the behaviour of complex32, else we will get different results
+    if dtype in (torch.float16, torch.int8):
+        return cos.to(torch.float16), sin.to(torch.float16)
+    return cos, sin
+
+
+def apply_rope(x:torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Applies Rotary Positional Embeddings (RoPE) to the input tensor x.
+
+    Args:
+        x: Input tensor of shape (B, T, n_heads, head_dim)
+        cos: Cosine positional embeddings of shape (T, head_dim // 2)
+        sin: Sine positional embeddings of shape (T, head_dim // 2)
+
+    Returns:
+        Tensor with RoPE applied, shape the same as x.
+    """
+    # cos and sin have shape (T, head_dim // 2), need to repeat to match x's last dim
+    # and add dimensions for batch and n_heads: (1, T, 1, head_dim)
+    cos = cos.repeat(1, 2).unsqueeze(0).unsqueeze(2)  # (1, T, 1, head_dim)
+    sin = sin.repeat(1, 2).unsqueeze(0).unsqueeze(2)  # (1, T, 1, head_dim)
+
+    # Split x into two halves
+    head_size = x.size(-1)
+    x1 = x[..., : head_size // 2]  # (B, T, n_heads, head_dim/2)
+    x2 = x[..., head_size // 2 :]  # (B, T, n_heads, head_dim/2)
+
+    # Rotate: [-x2, x1]
+    rotated = torch.cat((-x2, x1), dim=-1)  # (B, T, n_heads, head_dim)
+
+    # Apply rotation: x * cos + rotated * sin
+    roped = (x * cos) + (rotated * sin)
+    return roped.type_as(x)
+
+
+class SwiGLU(torch.nn.Module):
+    """SwiGLU Activation Function"""
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        assert config.intermediate_size is not None, "intermediate_size must not be None"
+        self.w1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        self.w2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_fc_1 = self.w1(x)
+        x_fc_2 = self.w2(x)
+        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
+        return self.w3(x)
+
+
+class LLaMAMLP(nn.Module):
+    """LlaMA MLP with SwiGLU activation"""
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.swiglu = SwiGLU(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.swiglu(x)
+
+
+class SelfAttention(nn.Module):
+    """Self-Attention for both Autoregressive and Diffusion Models"""
+    def __init__(self, config: Config, is_causal: bool) -> None:
+        super().__init__()
+        self.config = config
+        self.is_causal = is_causal
+
+        # key, query, value projections for all heads
+        qkv_proj_dim = (self.config.n_head + 2 * self.config.n_query_groups) * self.config.head_size    #type: ignore[arg-type]
+        self.attn = nn.Linear(self.config.n_embd, qkv_proj_dim, bias=self.config.bias)
+        # output projection
+        self.proj = nn.Linear(self.config.n_embd, self.config.n_embd, bias=self.config.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: RoPECache,
+        max_seq_length: Optional[int] = None,
+        mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        B, T, C = x.size()  # (B, T, n_embd)
+        qkv = self.attn(x)  # (B, T, qkv_proj_dim)
+
+        # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
+        q_per_kv = self.config.n_head // self.config.n_query_groups    # type: ignore[reportOperatorIssue]
+        total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
+        qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size)  # (B, T, n_query_groups, total_qkv, head_dim)
+
+        # split qkv into query, key, and value
+        q, k, v = qkv.split((q_per_kv, 1, 1), dim=-2)
+
+        q = q.reshape(B,  T, -1, self.config.head_size)  # (B, T, nh_q, head_dim)
+        k = k.reshape(B,  T, -1, self.config.head_size)
+        v = v.reshape(B,  T, -1, self.config.head_size)
+        cos, sin = rope
+
+        n_elem = int(self.config.rotary_percentage * self.config.head_size)    # type: ignore[reportOperatorIssue]
+        q_roped = apply_rope(q[..., :n_elem], cos, sin)
+        k_roped = apply_rope(k[..., :n_elem], cos, sin)
+        q = torch.cat((q_roped, q[..., n_elem:]), dim=-1)
+        k = torch.cat((k_roped, k[..., n_elem:]), dim=-1)
+
+        if kv_cache is not None:
+            cache_k, cache_v = kv_cache
+            cache_k, cache_v = cache_k.to(dtype=k.dtype), cache_v.to(dtype=v.dtype)
+
+            assert input_pos is not None, "input_pos must be provided when using kv_cache"
+            assert max_seq_length is not None, "max_seq_length must be provided when using kv_cache"
+
+            # check if reached token limit
+            if input_pos[-1] >= max_seq_length:
+                input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
+                # shift 1 position to the left
+                cache_k = torch.roll(cache_k, -1, dims=1)
+                cache_v = torch.roll(cache_v, -1, dims=1)
+
+            k = cache_k.index_copy_(1, input_pos, k)
+            v = cache_v.index_copy_(1, input_pos, v)
+            kv_cache = k, v
+
+        y = self.scaled_dot_product_attention(q, k, v, mask=mask)
+
+        y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.proj(y)
+
+        if self.is_causal:
+            return y, kv_cache
+        else:
+            return y
+
+    def scaled_dot_product_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
+    ):
+        """
+        Compute scaled dot-product attention
+        Args:
+            q: Query tensor of shape (B, n_heads, T, head_dim)
+            k: Key tensor of shape (B, n_heads, T, head_dim)
+            v: Value tensor of shape (B, n_heads, T, head_dim)
+            mask: Optional attention mask of shape (B, 1, T, T)
+        Returns:
+            Tensor after attention of shape (B, n_heads, T, head_dim)
+        """
+        assert self.config.head_size is not None, "head_size must not be None"
+        scale = 1.0 / math.sqrt(self.config.head_size)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if q.size() != k.size():
+             k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
+             v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=self.is_causal
+        )
+        return y.transpose(1, 2)
+
+
+class ARBlock(nn.Module):
+    """Transformer Block for Autoregressive Models"""
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.config = config
+
+        self.attn = SelfAttention(config, is_causal=True)
+        self.mlp = LLaMAMLP(config)
+        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: RoPECache,
+        max_seq_length: int,
+        mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        """
+        Args:
+            x: Input tensor of shape (B, T, n_embd)
+            rope: RoPECache containing cosine and sine positional embeddings
+            max_seq_length: Maximum sequence length for attention
+            mask: Optional attention mask of shape (B, 1, T, T)
+            input_pos: Optional input positions of shape (B, T)
+            kv_cache: Optional key-value cache for efficient decoding
+
+        Returns:
+            Tuple of:
+                - Output tensor of shape (B, T, n_embd)
+                - Updated KVCache if provided, else None
+        """
+
+        n_1 = self.norm_1(x)
+        h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
+        x = x + h
+        x = x + self.mlp(self.norm_2(x))
+        return x, new_kv_cache
+
+
+class DiffusionBlock(nn.Module):
+    """Transformer Block for Diffusion Models"""
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.config = config
+
+        self.attn = SelfAttention(config, is_causal=False)
+        self.mlp = LLaMAMLP(config)
+        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: RoPECache,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (B, T, n_embd)
+            rope: RoPECache containing cosine and sine positional embeddings
+
+        Returns:
+            Tuple of:
+                - Output tensor of shape (B, T, n_embd)
+                - None (no KVCache for diffusion models)
+        """
+
+        n_1 = self.norm_1(x)
+        h = self.attn(n_1, rope)
+        x = x + h
+        x = x + self.mlp(self.norm_2(x))
+        return x
+
+
+class BaseModel(nn.Module):
+    """Base Transformer Model (based on LlaMA2 architecture)"""
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.config = config
+
+        self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)   # type: ignore[call-arg]
+        self.rope_cache: Optional[RoPECache] = None
+
+    def _init_weights(self, module: nn.Module, n_layer) -> None:
+        """Meant to be used with `gpt.apply(gpt._init_weights)`."""
+        # GPT-NeoX  https://arxiv.org/pdf/2204.06745.pdf
+        if isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / self.config.n_embd))
+        elif isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / self.config.n_embd))
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        # GPT-NeoX
+        for name, p in module.named_parameters():
+            # if use xformer swiglu, fc2 layer will be renamed to w3
+            if (name == "proj.weight" and isinstance(module, LLaMAMLP)) or (name == "w3.weight" and isinstance(module, SwiGLU) or (name=="proj.weight" and isinstance(module, SelfAttention))):
+                nn.init.normal_(p, mean=0.0, std=1 / math.sqrt(self.config.n_embd)  /  n_layer)
+
+    @classmethod
+    def from_name(cls, name: str, **kwargs: Any) -> Self:
+        return cls(get_config_class(name, **kwargs))
+
+    def build_rope_cache(self, input: torch.Tensor) -> RoPECache:
+        assert self.config.head_size is not None, "head_size cannot be None for building RoPE cache"
+        return build_rope_cache(
+            seq_len=self.config.block_size,
+            n_elem=int(self.config.rotary_percentage * self.config.head_size),
+            dtype=torch.bfloat16,
+            device=input.device,
+            condense_ratio=self.config.rope_condense_ratio,
+        )
+
+
+class ARModel(BaseModel):
+    """Autoregressive Transformer Model (based on LlaMA2 architecture)"""
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Embedding(config.padded_vocab_size, config.n_embd),   # type: ignore[call-arg]
+                h=nn.ModuleList(ARBlock(config) for _ in range(config.n_layer)),
+                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+            )
+        )
+        self.mask_cache: Optional[torch.Tensor] = None
+        self.kv_caches: List[KVCache] = []
+
+    def build_mask_cache(self, input: torch.Tensor) -> torch.Tensor:
+        ones = torch.ones((self.config.block_size, self.config.block_size), device=input.device, dtype=torch.bool)
+        return torch.tril(ones).unsqueeze(0).unsqueeze(0)
+
+    def reset_cache(self) -> None:
+        self.kv_caches.clear()
+        if self.mask_cache is not None and self.mask_cache.device.type == "xla":
+            # https://github.com/Lightning-AI/lit-gpt/pull/83#issuecomment-1558150179
+            self.rope_cache = None
+            self.mask_cache = None
+
+    def build_kv_caches(self, input: torch.Tensor, max_seq_length: int, rope_cache_length: int) -> List[KVCache]:
+        assert self.config.head_size is not None, "head_size cannot be None for building KV cache"
+        assert self.config.n_query_groups is not None, "n_query_groups cannot be None for building KV cache"
+
+        B = input.size(0)
+        heads = 1 if self.config.n_query_groups == 1 else self.config.n_query_groups
+
+        k_cache_shape = (
+            B,
+            max_seq_length,
+            heads,
+            rope_cache_length + self.config.head_size - int(self.config.rotary_percentage * self.config.head_size),
+        )
+        v_cache_shape = (B, max_seq_length, heads, self.config.head_size)
+        device = input.device
+        return [
+            (torch.zeros(k_cache_shape, device=device), torch.zeros(v_cache_shape, device=device))
+            for _ in range(self.config.n_layer)
+        ]
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        max_seq_length: Optional[int] = None,
+        input_pos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, T = x.size()
+        use_kv_cache = input_pos is not None
+
+        block_size = self.config.block_size
+        if max_seq_length is None:
+            max_seq_length = block_size
+        if use_kv_cache:  # not relevant otherwise
+            assert (
+                max_seq_length >= T
+            ), f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
+        assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
+        assert block_size >= T, f"Cannot forward sequence of length {T}, block size is only {block_size}"
+
+        if self.rope_cache is None:
+            self.rope_cache = self.build_rope_cache(x)
+        # passing `attn_mask` to SDPA downgrades it to use the inefficient implementation. since we only need the mask
+        # for the kv-cache support (only during inference), we only create it in that situation
+        # this will be resolved by https://github.com/pytorch/pytorch/issues/96099
+        if use_kv_cache and self.mask_cache is None:
+            self.mask_cache = self.build_mask_cache(x)
+
+        cos, sin = self.rope_cache
+        if use_kv_cache:
+            cos = cos.index_select(0, input_pos)
+            sin = sin.index_select(0, input_pos)
+            mask = self.mask_cache.index_select(2, input_pos)   # type: ignore
+            mask = mask[:, :, :, :max_seq_length]
+        else:
+            cos = cos[:T]
+            sin = sin[:T]
+            mask = None
+
+        # forward the model itself
+        # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.wte(x)  # type: ignore[call-arg]
+
+        if not use_kv_cache:
+            for block in self.transformer.h:    # type: ignore[call-arg]
+                x, *_ = block(x, (cos, sin), max_seq_length)
+        else:
+            self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1) * 2)
+            for i, block in enumerate(self.transformer.h):  # type: ignore[call-arg]
+                x, self.kv_caches[i] = block(x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i])
+
+        x = self.transformer.ln_f(x)    # type: ignore[call-arg]
+
+        return self.lm_head(x)  # (b, t, vocab_size)
+        return x
+
+
+class MaskedDiffusionModel(BaseModel):
+    """Diffusion Transformer Model (based on LlaMA2 architecture)"""
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        self.transformer = nn.ModuleDict(
+            dict(
+                # +1 for the mask token
+                wte=nn.Embedding(config.padded_vocab_size + 1, config.n_embd),   # type: ignore[call-arg]
+                h=nn.ModuleList(DiffusionBlock(config) for _ in range(config.n_layer)),
+                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T = x.size()
+
+        block_size = self.config.block_size
+        assert block_size >= T, f"Cannot forward sequence of length {T}, block size is only {block_size}"
+
+        if self.rope_cache is None:
+            self.rope_cache = self.build_rope_cache(x)
+
+        cos, sin = self.rope_cache
+        cos = cos[:T]
+        sin = sin[:T]
+
+        # forward the model itself
+        # token embeddings of shape (B, T, n_embd)
+        x = self.transformer.wte(x)   # type: ignore[call-arg]
+
+        for block in self.transformer.h:    # type: ignore[call-arg]
+            x = block(x, (cos, sin))
+
+        x = self.transformer.ln_f(x)    # type: ignore[call-arg]
+
+        return self.lm_head(x)  # (B, T, vocab_size)
+
+        return x
